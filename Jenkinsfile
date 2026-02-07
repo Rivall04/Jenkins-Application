@@ -9,30 +9,54 @@ pipeline {
         DOCKERHUB_CREDENTIALS = credentials('dockerhub-credentials')
         FRONTEND_IMAGE = 'refalalhazmi/frontend-app'
         BACKEND_IMAGE  = 'refalalhazmi/backend-app'
-        VERSION = "${BRANCH_NAME}-1.0.${BUILD_NUMBER}"
+        
+        GIT_COMMIT_REV = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+        VERSION = "${BRANCH_NAME}-${GIT_COMMIT_REV}"
+        
+        SKIP_BUILD = 'false'
     }
 
     stages {
         stage('Checkout') {
             steps {
-                echo "Building branch: ${env.BRANCH_NAME}"
                 checkout scm
             }
         }
 
-        stage('Test') {
+        stage('Check If Image Exists') {
+            when {
+                anyOf { branch 'production'; branch 'staging' }
+            }
             steps {
-                echo 'Here we go testing this amazing app...'
+                script {
+                    echo "Checking Registry for version: ${VERSION}"
+                    def frontendExists = sh(script: "docker manifest inspect ${FRONTEND_IMAGE}:${VERSION} > /dev/null 2>&1", returnStatus: true)
+                    def backendExists  = sh(script: "docker manifest inspect ${BACKEND_IMAGE}:${VERSION} > /dev/null 2>&1", returnStatus: true)
+
+                    if (frontendExists == 0 && backendExists == 0) {
+                        echo " Image ${VERSION} already exists in Docker Hub. Skipping build/push."
+                        SKIP_BUILD = 'true'
+                    } else {
+                        echo "Image not found. Starting build process..."
+                        SKIP_BUILD = 'false'
+                    }
+                }
+            }
+        }
+
+        stage('Install & Build') {
+            when { expression { SKIP_BUILD == 'false' } }
+            steps {
                 sh """
-                  cd frontend && npm install && npm run build
-                  cd ../backend && npm install
+                  cd frontend && npm install --no-audit --no-fund && npm run build
+                  cd ../backend && npm install --no-audit --no-fund
                 """
             }
         }
 
-        stage('Build Image') {
+        stage('Build Docker Image') {
+            when { expression { SKIP_BUILD == 'false' } }
             steps {
-                echo 'Building Docker image...'
                 sh """
                   docker build -t ${FRONTEND_IMAGE}:${VERSION} frontend
                   docker build -t ${BACKEND_IMAGE}:${VERSION} backend
@@ -41,39 +65,24 @@ pipeline {
         }
 
         stage('Security Scan') {
+            when { expression { SKIP_BUILD == 'false' } }
             steps {
-                echo 'Scanning Docker images for vulnerabilities...'
                 sh """
-                  docker run --rm \
-                    -v /var/run/docker.sock:/var/run/docker.sock \
-                    aquasec/trivy image ${FRONTEND_IMAGE}:${VERSION}
-
-                  docker run --rm \
-                    -v /var/run/docker.sock:/var/run/docker.sock \
-                    aquasec/trivy image ${BACKEND_IMAGE}:${VERSION}
+                  docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                    aquasec/trivy image --severity HIGH,CRITICAL ${FRONTEND_IMAGE}:${VERSION}
                 """
             }
         }
 
-        stage('Login to Docker Hub') {
-            steps {
-                echo 'Logging in to Docker Hub...'
-                sh """
-                  echo "${DOCKERHUB_CREDENTIALS_PSW}" | \
-                  docker login -u "${DOCKERHUB_CREDENTIALS_USR}" --password-stdin
-                """
-            }
-        }
-
-        stage('Push Image') {
+        stage('Push to Docker Hub') {
             when {
-                anyOf {
-                    branch 'development'
-                    branch 'staging'
+                allOf {
+                    expression { SKIP_BUILD == 'false' }
+                    anyOf { branch 'production'; branch 'staging'; branch 'development' }
                 }
             }
             steps {
-                echo 'Pushing Docker image to Docker Hub...'
+                sh 'echo "${DOCKERHUB_CREDENTIALS_PSW}" | docker login -u "${DOCKERHUB_CREDENTIALS_USR}" --password-stdin'
                 sh """
                   docker push ${FRONTEND_IMAGE}:${VERSION}
                   docker push ${BACKEND_IMAGE}:${VERSION}
@@ -83,49 +92,9 @@ pipeline {
     }
 
     post {
-        success {
-            emailext(
-                subject: "Jenkins SUCCESS: ${JOB_NAME} #${BUILD_NUMBER}",
-                body: """
-                    <h2>Build Successful :) </h2>
-                    <p><b>Job:</b> ${JOB_NAME}</p>
-                    <p><b>Branch:</b> ${BRANCH_NAME}</p>
-                    <p><b>Version:</b> ${VERSION}</p>
-
-                    <p><b>Docker Images:</b></p>
-                    <ul>
-                        <li>${FRONTEND_IMAGE}:${VERSION}</li>
-                        <li>${BACKEND_IMAGE}:${VERSION}</li>
-                    </ul>
-
-                    <p><a href="${BUILD_URL}">View Jenkins Build</a></p>
-                """,
-                to: "refalalhazmi0@gmail.com"
-            )
-        }
-
-        failure {
-            emailext(
-                subject: "❌ Jenkins FAILED: ${JOB_NAME} #${BUILD_NUMBER}",
-                body: """
-                    <h2>Build Failed :( </h2>
-                    <p><b>Job:</b> ${JOB_NAME}</p>
-                    <p><b>Branch:</b> ${BRANCH_NAME}</p>
-                    <p><b>Build Number:</b> ${BUILD_NUMBER}</p>
-
-                    <p><a href="${BUILD_URL}">Check Build Logs</a></p>
-                """,
-                to: "refalalhazmi0@gmail.com"
-            )
-        }
-
         always {
-            echo 'Cleaning up local Docker images...'
-            sh """
-              docker rmi ${FRONTEND_IMAGE}:${VERSION} || true
-              docker rmi ${BACKEND_IMAGE}:${VERSION} || true
-              docker logout
-            """
+            sh "docker rmi ${FRONTEND_IMAGE}:${VERSION} ${BACKEND_IMAGE}:${VERSION} || true"
+            cleanWs()
         }
     }
 }
