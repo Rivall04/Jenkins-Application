@@ -7,125 +7,76 @@ pipeline {
 
     environment {
         DOCKERHUB_CREDENTIALS = credentials('dockerhub-credentials')
-        FRONTEND_IMAGE = 'refalalhazmi/frontend-app'
-        BACKEND_IMAGE  = 'refalalhazmi/backend-app'
-        VERSION = "${BRANCH_NAME}-1.0.${BUILD_NUMBER}"
+        
+        PROD_REPO_FRONT    = 'refalalhazmi/prod-frontend'
+        STAGING_REPO_FRONT = 'refalalhazmi/staging-frontend'
+        
+        PROD_REPO_BACK     = 'refalalhazmi/prod-backend'
+        STAGING_REPO_BACK  = 'refalalhazmi/staging-backend'
+
+        TARGET_IMAGE_FRONT = "${BRANCH_NAME == 'production' ? PROD_REPO_FRONT : STAGING_REPO_FRONT}"
+        TARGET_IMAGE_BACK  = "${BRANCH_NAME == 'production' ? PROD_REPO_BACK : STAGING_REPO_BACK}"
+        
+        GIT_TAG = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+        SKIP_BUILD = 'false'
     }
 
     stages {
-        stage('Checkout') {
+        stage('Check Registry') {
+            when { anyOf { branch 'production'; branch 'staging' } }
             steps {
-                echo "Building branch: ${env.BRANCH_NAME}"
-                checkout scm
+                script {
+                    echo "Checking Registry: ${TARGET_IMAGE_FRONT} for tag: ${GIT_TAG}"
+                    
+                    def imageExists = sh(script: "docker manifest inspect ${TARGET_IMAGE_FRONT}:${GIT_TAG} > /dev/null 2>&1", returnStatus: true)
+                    
+                    if (imageExists == 0) {
+                        echo "Version ${GIT_TAG} already exists in ${TARGET_IMAGE_FRONT}. Skipping build."
+                        SKIP_BUILD = 'true'
+                    } else {
+                        SKIP_BUILD = 'false'
+                    }
+                }
             }
         }
 
-        stage('Test') {
+        stage('Install & Build') {
+            when { expression { SKIP_BUILD == 'false' } }
             steps {
-                echo 'Here we go testing this amazing app...'
                 sh """
-                  cd frontend && npm install && npm run build
-                  cd ../backend && npm install
+                  cd frontend && npm install --no-audit --no-fund && npm run build
+                  cd ../backend && npm install --no-audit --no-fund
                 """
             }
         }
 
-        stage('Build Image') {
-            steps {
-                echo 'Building Docker image...'
-                sh """
-                  docker build -t ${FRONTEND_IMAGE}:${VERSION} frontend
-                  docker build -t ${BACKEND_IMAGE}:${VERSION} backend
-                """
-            }
-        }
-
-        stage('Security Scan') {
-            steps {
-                echo 'Scanning Docker images for vulnerabilities...'
-                sh """
-                  docker run --rm \
-                    -v /var/run/docker.sock:/var/run/docker.sock \
-                    aquasec/trivy image ${FRONTEND_IMAGE}:${VERSION}
-
-                  docker run --rm \
-                    -v /var/run/docker.sock:/var/run/docker.sock \
-                    aquasec/trivy image ${BACKEND_IMAGE}:${VERSION}
-                """
-            }
-        }
-
-        stage('Login to Docker Hub') {
-            steps {
-                echo 'Logging in to Docker Hub...'
-                sh """
-                  echo "${DOCKERHUB_CREDENTIALS_PSW}" | \
-                  docker login -u "${DOCKERHUB_CREDENTIALS_USR}" --password-stdin
-                """
-            }
-        }
-
-        stage('Push Image') {
+        stage('Docker Build & Push') {
             when {
-                anyOf {
-                    branch 'development'
-                    branch 'staging'
+                allOf {
+                    expression { SKIP_BUILD == 'false' }
+                    anyOf { branch 'production'; branch 'staging' }
                 }
             }
             steps {
-                echo 'Pushing Docker image to Docker Hub...'
+                sh 'echo "${DOCKERHUB_CREDENTIALS_PSW}" | docker login -u "${DOCKERHUB_CREDENTIALS_USR}" --password-stdin'
                 sh """
-                  docker push ${FRONTEND_IMAGE}:${VERSION}
-                  docker push ${BACKEND_IMAGE}:${VERSION}
+                  docker build -t ${TARGET_IMAGE_FRONT}:${GIT_TAG} -t ${TARGET_IMAGE_FRONT}:latest frontend
+                  docker build -t ${TARGET_IMAGE_BACK}:${GIT_TAG} -t ${TARGET_IMAGE_BACK}:latest backend
+                  
+                  docker push ${TARGET_IMAGE_FRONT}:${GIT_TAG}
+                  docker push ${TARGET_IMAGE_FRONT}:latest
+                  docker push ${TARGET_IMAGE_BACK}:${GIT_TAG}
+                  docker push ${TARGET_IMAGE_BACK}:latest
                 """
             }
         }
     }
 
     post {
-        success {
-            emailext(
-                subject: "Jenkins SUCCESS: ${JOB_NAME} #${BUILD_NUMBER}",
-                body: """
-                    <h2>Build Successful :) </h2>
-                    <p><b>Job:</b> ${JOB_NAME}</p>
-                    <p><b>Branch:</b> ${BRANCH_NAME}</p>
-                    <p><b>Version:</b> ${VERSION}</p>
-
-                    <p><b>Docker Images:</b></p>
-                    <ul>
-                        <li>${FRONTEND_IMAGE}:${VERSION}</li>
-                        <li>${BACKEND_IMAGE}:${VERSION}</li>
-                    </ul>
-
-                    <p><a href="${BUILD_URL}">View Jenkins Build</a></p>
-                """,
-                to: "refalalhazmi0@gmail.com"
-            )
-        }
-
-        failure {
-            emailext(
-                subject: "❌ Jenkins FAILED: ${JOB_NAME} #${BUILD_NUMBER}",
-                body: """
-                    <h2>Build Failed :( </h2>
-                    <p><b>Job:</b> ${JOB_NAME}</p>
-                    <p><b>Branch:</b> ${BRANCH_NAME}</p>
-                    <p><b>Build Number:</b> ${BUILD_NUMBER}</p>
-
-                    <p><a href="${BUILD_URL}">Check Build Logs</a></p>
-                """,
-                to: "refalalhazmi0@gmail.com"
-            )
-        }
-
         always {
-            echo 'Cleaning up local Docker images...'
-            sh """
-              docker rmi ${FRONTEND_IMAGE}:${VERSION} || true
-              docker rmi ${BACKEND_IMAGE}:${VERSION} || true
-              docker logout
-            """
+            sh "docker rmi ${TARGET_IMAGE_FRONT}:${GIT_TAG} ${TARGET_IMAGE_FRONT}:latest || true"
+            sh "docker rmi ${TARGET_IMAGE_BACK}:${GIT_TAG} ${TARGET_IMAGE_BACK}:latest || true"
+            cleanWs()
         }
     }
 }
