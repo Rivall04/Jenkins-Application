@@ -40,7 +40,7 @@ pipeline {
             }
         }
 
-        stage('Install & Build') {
+        stage('Build') {
             when { expression { SKIP_BUILD == 'false' } }
             steps {
                 sh """
